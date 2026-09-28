@@ -1,999 +1,626 @@
 import os
-import sqlite3
-import secrets
-from datetime import datetime, timedelta
-from functools import wraps
+import base64
+from io import BytesIO
 
-from flask import (
-    Flask, request, redirect, url_for, session,
-    render_template_string, flash
-)
+from flask import Flask, request, jsonify, render_template_string
+from google import genai
+from google.genai import types
 
 app = Flask(__name__)
 
-app.secret_key = os.environ.get(
-    "SECRET_KEY",
-    "change-this-secret-key"
-)
+# =========================================================
+# GEMINI
+# =========================================================
 
-DB = "ai_studio.db"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# FAQAT SIZNING EMAIL INGIZNI RENDER ENVIRONMENT'DA BERASIZ
-ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "").lower().strip()
-
-
-# =========================
-# DATABASE
-# =========================
-
-def db():
-    con = sqlite3.connect(DB)
-    con.row_factory = sqlite3.Row
-    return con
+if GEMINI_API_KEY:
+    client = genai.Client(api_key=GEMINI_API_KEY)
+else:
+    client = None
 
 
-def init_db():
-    con = db()
+# =========================================================
+# FRONTEND
+# =========================================================
 
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            email TEXT UNIQUE NOT NULL,
-            plan TEXT DEFAULT 'free',
-            videos INTEGER DEFAULT 0,
-            images INTEGER DEFAULT 0,
-            blocked INTEGER DEFAULT 0,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
+HTML = """
+<!DOCTYPE html>
+<html lang="uz">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
 
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS plans (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            code TEXT UNIQUE NOT NULL,
-            name TEXT NOT NULL,
-            price TEXT DEFAULT '0',
-            videos INTEGER DEFAULT 0,
-            images INTEGER DEFAULT 0,
-            days INTEGER DEFAULT 30,
-            active INTEGER DEFAULT 1
-        )
-    """)
+    <title>AI Studio</title>
 
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS receipts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            text TEXT NOT NULL,
-            status TEXT DEFAULT 'pending',
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
+    <style>
+        * {
+            box-sizing: border-box;
+        }
 
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        )
-    """)
+        body {
+            margin: 0;
+            font-family: Arial, sans-serif;
+            background:
+                radial-gradient(circle at top left, #263b80, transparent 35%),
+                radial-gradient(circle at bottom right, #63258c, transparent 35%),
+                #080b16;
+            color: white;
+            min-height: 100vh;
+        }
 
-    defaults = [
-        ("app_name", "AI STUDIO"),
-        ("payment_card", ""),
-        ("welcome_text", "Professional AI Studio"),
-    ]
+        .header {
+            padding: 22px;
+            text-align: center;
+        }
 
-    for key, value in defaults:
-        con.execute(
-            "INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",
-            (key, value)
-        )
+        .logo {
+            font-size: 32px;
+            font-weight: 900;
+            letter-spacing: 1px;
+        }
 
-    plans = [
-        ("small", "Kichik", "0", 5, 10, 4),
-        ("medium", "O‘rta", "0", 30, 60, 30),
-        ("large", "Katta", "0", 100, 200, 30),
-    ]
+        .subtitle {
+            color: #aeb6d4;
+            margin-top: 7px;
+        }
 
-    for plan in plans:
-        con.execute("""
-            INSERT OR IGNORE INTO
-            plans(code,name,price,videos,images,days)
-            VALUES(?,?,?,?,?,?)
-        """, plan)
+        .container {
+            width: min(1000px, 94%);
+            margin: auto;
+            padding-bottom: 50px;
+        }
 
-    con.commit()
-    con.close()
+        .tabs {
+            display: flex;
+            gap: 10px;
+            margin: 20px 0;
+            flex-wrap: wrap;
+        }
+
+        button {
+            border: 0;
+            border-radius: 14px;
+            padding: 13px 18px;
+            cursor: pointer;
+            font-weight: 700;
+            color: white;
+            background: #202844;
+        }
+
+        button.active {
+            background: linear-gradient(135deg, #6d5dfc, #a64cff);
+        }
+
+        .card {
+            background: rgba(17, 23, 43, .88);
+            border: 1px solid rgba(255,255,255,.08);
+            border-radius: 24px;
+            padding: 25px;
+            box-shadow: 0 20px 60px rgba(0,0,0,.25);
+            margin-bottom: 20px;
+        }
+
+        h2 {
+            margin-top: 0;
+        }
+
+        textarea {
+            width: 100%;
+            min-height: 150px;
+            resize: vertical;
+            border: 1px solid #303955;
+            border-radius: 16px;
+            background: #0d1223;
+            color: white;
+            padding: 17px;
+            outline: none;
+            font-size: 16px;
+        }
+
+        textarea:focus {
+            border-color: #795cff;
+        }
+
+        .generate {
+            margin-top: 14px;
+            width: 100%;
+            background: linear-gradient(135deg, #715cff, #b044ff);
+            font-size: 17px;
+            padding: 16px;
+        }
+
+        .result {
+            margin-top: 20px;
+            padding: 18px;
+            background: #0b1020;
+            border-radius: 16px;
+            white-space: pre-wrap;
+            line-height: 1.6;
+            min-height: 60px;
+        }
+
+        .result img {
+            width: 100%;
+            max-width: 900px;
+            border-radius: 18px;
+            display: block;
+            margin: auto;
+        }
+
+        .hidden {
+            display: none;
+        }
+
+        .status {
+            font-size: 14px;
+            color: #aeb6d4;
+            margin-top: 10px;
+        }
+
+        .error {
+            color: #ff7777;
+        }
+
+        .success {
+            color: #73e6a0;
+        }
+    </style>
+</head>
+
+<body>
+
+<div class="header">
+    <div class="logo">✨ AI Studio</div>
+    <div class="subtitle">
+        Chat • Image • AI
+    </div>
+</div>
+
+<div class="container">
+
+    <div class="tabs">
+        <button class="tab active" onclick="showTab('chat', this)">
+            💬 AI Chat
+        </button>
+
+        <button class="tab" onclick="showTab('image', this)">
+            🖼️ Rasm yaratish
+        </button>
+    </div>
 
 
-init_db()
+    <!-- CHAT -->
+
+    <div id="chat" class="card">
+
+        <h2>💬 AI Chat</h2>
+
+        <textarea
+            id="chatPrompt"
+            placeholder="Savolingizni yozing..."
+        ></textarea>
+
+        <button class="generate" onclick="chat()">
+            🚀 AI'ga yuborish
+        </button>
+
+        <div id="chatStatus" class="status"></div>
+
+        <div id="chatResult" class="result">
+            Javob shu yerda chiqadi.
+        </div>
+
+    </div>
 
 
-# =========================
-# HELPERS
-# =========================
+    <!-- IMAGE -->
 
-def get_user():
-    uid = session.get("user_id")
+    <div id="image" class="card hidden">
 
-    if not uid:
-        return None
+        <h2>🖼️ AI Rasm Generator</h2>
 
-    con = db()
-    user = con.execute(
-        "SELECT * FROM users WHERE id=?",
-        (uid,)
-    ).fetchone()
-    con.close()
+        <textarea
+            id="imagePrompt"
+            placeholder="Masalan: Futuristik Toshkent shahri, kechasi, neon chiroqlar, cinematic, ultra detailed..."
+        ></textarea>
 
-    return user
+        <button class="generate" onclick="generateImage()">
+            🎨 Rasm yaratish
+        </button>
 
+        <div id="imageStatus" class="status"></div>
 
-def admin_required(func):
-    @wraps(func)
-    def wrapper(*args, **kwargs):
+        <div id="imageResult" class="result">
+            Rasm shu yerda chiqadi.
+        </div>
 
-        user = get_user()
+    </div>
 
-        if not user:
-            return redirect(url_for("login"))
-
-        # ADMIN FAQAT EMAIL ORQALI SERVER TOMONIDA TEKSHIRILADI
-        if not ADMIN_EMAIL:
-            return "ADMIN_EMAIL Render Environment'da sozlanmagan.", 403
-
-        if user["email"].lower() != ADMIN_EMAIL:
-            return "403 — Admin huquqi yo‘q.", 403
-
-        if user["blocked"]:
-            return "Account blocked.", 403
-
-        return func(*args, **kwargs)
-
-    return wrapper
+</div>
 
 
-# =========================
-# DESIGN
-# =========================
+<script>
 
-CSS = """
-<style>
-*{
-    box-sizing:border-box;
+function showTab(name, button) {
+
+    document.getElementById("chat").classList.add("hidden");
+    document.getElementById("image").classList.add("hidden");
+
+    document.getElementById(name).classList.remove("hidden");
+
+    document.querySelectorAll(".tab").forEach(
+        x => x.classList.remove("active")
+    );
+
+    button.classList.add("active");
 }
 
-body{
-    margin:0;
-    font-family:Inter,Arial,sans-serif;
-    background:
-      radial-gradient(circle at 20% 10%,#33206b 0,transparent 35%),
-      radial-gradient(circle at 90% 20%,#075985 0,transparent 30%),
-      #070711;
-    color:white;
-    min-height:100vh;
-}
 
-nav{
-    display:flex;
-    justify-content:space-between;
-    align-items:center;
-    padding:18px 6%;
-    border-bottom:1px solid rgba(255,255,255,.1);
-    backdrop-filter:blur(20px);
-}
+// =========================================================
+// CHAT
+// =========================================================
 
-.logo{
-    font-size:25px;
-    font-weight:900;
-}
+async function chat() {
 
-.logo span{
-    color:#8b5cf6;
-}
+    const prompt =
+        document.getElementById("chatPrompt").value.trim();
 
-.container{
-    width:min(1150px,92%);
-    margin:40px auto;
-}
+    const status =
+        document.getElementById("chatStatus");
 
-.hero{
-    text-align:center;
-    padding:70px 20px;
-}
+    const result =
+        document.getElementById("chatResult");
 
-.hero h1{
-    font-size:clamp(42px,8vw,82px);
-    margin:0;
-    background:linear-gradient(90deg,#fff,#a78bfa,#38bdf8);
-    -webkit-background-clip:text;
-    color:transparent;
-}
-
-.hero p{
-    color:#aaa;
-    font-size:18px;
-}
-
-.grid{
-    display:grid;
-    grid-template-columns:repeat(auto-fit,minmax(230px,1fr));
-    gap:20px;
-}
-
-.card{
-    background:rgba(255,255,255,.07);
-    border:1px solid rgba(255,255,255,.1);
-    border-radius:25px;
-    padding:25px;
-    backdrop-filter:blur(20px);
-    box-shadow:0 20px 60px rgba(0,0,0,.25);
-}
-
-.card h2{
-    margin-top:0;
-}
-
-button,.btn{
-    border:0;
-    border-radius:14px;
-    padding:13px 20px;
-    background:linear-gradient(90deg,#7c3aed,#2563eb);
-    color:white;
-    font-weight:800;
-    cursor:pointer;
-    text-decoration:none;
-    display:inline-block;
-}
-
-input,textarea,select{
-    width:100%;
-    padding:14px;
-    margin:8px 0 15px;
-    border-radius:13px;
-    border:1px solid #333;
-    background:#11111c;
-    color:white;
-}
-
-table{
-    width:100%;
-    border-collapse:collapse;
-}
-
-td,th{
-    padding:13px;
-    border-bottom:1px solid rgba(255,255,255,.1);
-    text-align:left;
-}
-
-.badge{
-    padding:5px 10px;
-    border-radius:20px;
-    background:#312e81;
-}
-
-.danger{
-    color:#fb7185;
-}
-
-.success{
-    color:#4ade80;
-}
-
-@media(max-width:600px){
-    nav{
-        padding:15px;
+    if (!prompt) {
+        status.innerHTML =
+            '<span class="error">Savol yozing.</span>';
+        return;
     }
 
-    .container{
-        width:94%;
-        margin:20px auto;
-    }
+    status.innerHTML = "⏳ AI javob tayyorlamoqda...";
+    result.innerText = "";
 
-    .hero{
-        padding:45px 10px;
+    try {
+
+        const response = await fetch("/api/chat", {
+
+            method: "POST",
+
+            headers: {
+                "Content-Type": "application/json"
+            },
+
+            body: JSON.stringify({
+                prompt: prompt
+            })
+
+        });
+
+        const data = await response.json();
+
+        if (!response.ok) {
+            throw new Error(
+                data.error || "Xatolik yuz berdi"
+            );
+        }
+
+        result.innerText = data.answer;
+
+        status.innerHTML =
+            '<span class="success">✅ Tayyor</span>';
+
+    } catch (error) {
+
+        status.innerHTML =
+            '<span class="error">' +
+            error.message +
+            '</span>';
+
     }
 }
-</style>
+
+
+// =========================================================
+// IMAGE
+// =========================================================
+
+async function generateImage() {
+
+    const prompt =
+        document.getElementById("imagePrompt").value.trim();
+
+    const status =
+        document.getElementById("imageStatus");
+
+    const result =
+        document.getElementById("imageResult");
+
+    if (!prompt) {
+        status.innerHTML =
+            '<span class="error">Prompt yozing.</span>';
+        return;
+    }
+
+    status.innerHTML =
+        "⏳ Rasm yaratilmoqda... Bu biroz vaqt olishi mumkin.";
+
+    result.innerHTML = "";
+
+    try {
+
+        const response = await fetch(
+            "/api/image",
+            {
+                method: "POST",
+
+                headers: {
+                    "Content-Type": "application/json"
+                },
+
+                body: JSON.stringify({
+                    prompt: prompt
+                })
+            }
+        );
+
+        const data = await response.json();
+
+        if (!response.ok) {
+            throw new Error(
+                data.error || "Rasm yaratilmadi"
+            );
+        }
+
+        if (!data.image) {
+            throw new Error(
+                "Gemini rasm qaytarmadi."
+            );
+        }
+
+        const img = document.createElement("img");
+
+        img.src =
+            "data:" +
+            data.mime_type +
+            ";base64," +
+            data.image;
+
+        result.appendChild(img);
+
+        status.innerHTML =
+            '<span class="success">✅ Rasm tayyor</span>';
+
+    } catch (error) {
+
+        status.innerHTML =
+            '<span class="error">' +
+            error.message +
+            '</span>';
+
+    }
+}
+
+</script>
+
+</body>
+</html>
 """
 
 
-# =========================
+# =========================================================
 # HOME
-# =========================
+# =========================================================
 
 @app.route("/")
 def home():
+    return render_template_string(HTML)
 
-    return render_template_string(
-        CSS + """
-        <nav>
-            <div class="logo">AI <span>STUDIO</span></div>
-            <a class="btn" href="/login">Kirish</a>
-        </nav>
 
-        <div class="hero container">
-            <h1>AI STUDIO</h1>
-            <p>
-                Chat. Image. Video. Everything in one professional AI platform.
-            </p>
-
-            <br>
-
-            <a class="btn" href="/login">
-                Boshlash →
-            </a>
-        </div>
-
-        <div class="container grid">
-
-            <div class="card">
-                <h2>🤖 AI Chat</h2>
-                <p>AI bilan suhbatlashish.</p>
-            </div>
-
-            <div class="card">
-                <h2>🖼️ AI Image</h2>
-                <p>Prompt asosida rasm yaratish.</p>
-            </div>
-
-            <div class="card">
-                <h2>🎬 AI Video</h2>
-                <p>Prompt asosida video yaratish.</p>
-            </div>
-
-            <div class="card">
-                <h2>👑 Admin</h2>
-                <p>Platformani egasi boshqaradi.</p>
-            </div>
-
-        </div>
-        """
-    )
-
-
-# =========================
-# LOGIN
-# =========================
-
-@app.route("/login", methods=["GET", "POST"])
-def login():
-
-    if request.method == "POST":
-
-        name = request.form.get("name", "").strip()
-        email = request.form.get("email", "").strip().lower()
-
-        if not name or not email:
-            flash("Ism va email kerak.")
-            return redirect(url_for("login"))
-
-        con = db()
-
-        user = con.execute(
-            "SELECT * FROM users WHERE email=?",
-            (email,)
-        ).fetchone()
-
-        if not user:
-
-            con.execute("""
-                INSERT INTO users(name,email)
-                VALUES(?,?)
-            """, (name, email))
-
-            con.commit()
-
-            user = con.execute(
-                "SELECT * FROM users WHERE email=?",
-                (email,)
-            ).fetchone()
-
-        con.close()
-
-        if user["blocked"]:
-            return "Sizning profilingiz bloklangan.", 403
-
-        session["user_id"] = user["id"]
-
-        return redirect(url_for("dashboard"))
-
-    return render_template_string(
-        CSS + """
-        <div class="container" style="max-width:500px">
-
-            <div class="card">
-
-                <h1>AI STUDIO</h1>
-
-                <p>Kirish</p>
-
-                <form method="POST">
-
-                    <input
-                        name="name"
-                        placeholder="Ismingiz"
-                        required
-                    >
-
-                    <input
-                        name="email"
-                        type="email"
-                        placeholder="Email"
-                        required
-                    >
-
-                    <button type="submit">
-                        Kirish
-                    </button>
-
-                </form>
-
-            </div>
-
-        </div>
-        """
-    )
-
-
-# =========================
-# LOGOUT
-# =========================
-
-@app.route("/logout")
-def logout():
-
-    session.clear()
-
-    return redirect(url_for("home"))
-
-
-# =========================
-# DASHBOARD
-# =========================
-
-@app.route("/dashboard")
-def dashboard():
-
-    user = get_user()
-
-    if not user:
-        return redirect(url_for("login"))
-
-    con = db()
-
-    plans = con.execute(
-        "SELECT * FROM plans WHERE active=1"
-    ).fetchall()
-
-    con.close()
-
-    return render_template_string(
-        CSS + """
-        <nav>
-            <div class="logo">AI <span>STUDIO</span></div>
-
-            <div>
-                {{user["name"]}}
-                |
-                <a href="/logout">Chiqish</a>
-            </div>
-        </nav>
-
-        <div class="container">
-
-            <h1>Salom, {{user["name"]}} 👋</h1>
-
-            <div class="grid">
-
-                <div class="card">
-                    <h2>🤖 AI Chat</h2>
-                    <p>Savollarga AI javob beradi.</p>
-                    <a class="btn" href="/chat">Ochish</a>
-                </div>
-
-                <div class="card">
-                    <h2>🖼️ AI Image</h2>
-                    <p>Rasm yaratish.</p>
-                    <a class="btn" href="/image">Ochish</a>
-                </div>
-
-                <div class="card">
-                    <h2>🎬 AI Video</h2>
-                    <p>Video yaratish.</p>
-                    <a class="btn" href="/video">Ochish</a>
-                </div>
-
-                <div class="card">
-                    <h2>💳 Obuna</h2>
-                    <p>O‘zingizga mos tarifni tanlang.</p>
-                    <a class="btn" href="/plans">Ko‘rish</a>
-                </div>
-
-                <div class="card">
-                    <h2>🧾 Chek</h2>
-                    <p>To‘lov chekini yuborish.</p>
-                    <a class="btn" href="/receipt">Yuborish</a>
-                </div>
-
-            </div>
-
-        </div>
-        """,
-        user=user,
-        plans=plans
-    )
-
-
-# =========================
-# PLANS
-# =========================
-
-@app.route("/plans")
-def plans():
-
-    user = get_user()
-
-    if not user:
-        return redirect(url_for("login"))
-
-    con = db()
-    plans = con.execute(
-        "SELECT * FROM plans WHERE active=1"
-    ).fetchall()
-    con.close()
-
-    return render_template_string(
-        CSS + """
-        <div class="container">
-
-            <h1>💎 Obunalar</h1>
-
-            <div class="grid">
-
-            {% for p in plans %}
-
-                <div class="card">
-
-                    <h2>{{p["name"]}}</h2>
-
-                    <h1>{{p["price"]}}</h1>
-
-                    <p>🎬 {{p["videos"]}} video</p>
-                    <p>🖼️ {{p["images"]}} rasm</p>
-                    <p>📅 {{p["days"]}} kun</p>
-
-                    <a class="btn"
-                       href="/receipt?plan={{p['code']}}">
-                       Obuna olish
-                    </a>
-
-                </div>
-
-            {% endfor %}
-
-            </div>
-
-        </div>
-        """,
-        plans=plans
-    )
-
-
-# =========================
-# RECEIPT
-# =========================
-
-@app.route("/receipt", methods=["GET", "POST"])
-def receipt():
-
-    user = get_user()
-
-    if not user:
-        return redirect(url_for("login"))
-
-    con = db()
-
-    card = con.execute(
-        "SELECT value FROM settings WHERE key='payment_card'"
-    ).fetchone()
-
-    card_number = card["value"] if card else ""
-
-    if request.method == "POST":
-
-        text = request.form.get("receipt", "").strip()
-
-        if not text:
-            con.close()
-            return "Chek ma'lumotini kiriting.", 400
-
-        con.execute("""
-            INSERT INTO receipts(user_id,text)
-            VALUES(?,?)
-        """, (user["id"], text))
-
-        con.commit()
-        con.close()
-
-        return "Chek yuborildi. Admin tekshiradi."
-
-    con.close()
-
-    return render_template_string(
-        CSS + """
-        <div class="container">
-
-            <div class="card">
-
-                <h1>🧾 To‘lov</h1>
-
-                <p>Karta:</p>
-
-                <h2>{{card}}</h2>
-
-                <form method="POST">
-
-                    <textarea
-                        name="receipt"
-                        rows="6"
-                        placeholder="Chek ma'lumotini shu yerga yuboring..."
-                        required></textarea>
-
-                    <button>
-                        Chek yuborish
-                    </button>
-
-                </form>
-
-            </div>
-
-        </div>
-        """,
-        card=card_number
-    )
-
-
-# =========================
-# CHAT
-# =========================
-
-@app.route("/chat", methods=["GET", "POST"])
-def chat():
-
-    user = get_user()
-
-    if not user:
-        return redirect(url_for("login"))
-
-    answer = None
-
-    if request.method == "POST":
-
-        question = request.form.get("question", "").strip()
-
-        # Bu joyga keyinchalik haqiqiy AI model provider ulanadi.
-        answer = (
-            "AI engine hali ulanmagan. "
-            "Bu joy ataylab soxta javob bermaydi."
-        )
-
-    return render_template_string(
-        CSS + """
-        <div class="container">
-
-            <div class="card">
-
-                <h1>🤖 AI CHAT</h1>
-
-                <form method="POST">
-
-                    <textarea
-                        name="question"
-                        rows="6"
-                        placeholder="Savolingiz..."
-                        required></textarea>
-
-                    <button>
-                        Yuborish
-                    </button>
-
-                </form>
-
-                {% if answer %}
-
-                <div class="card">
-                    {{answer}}
-                </div>
-
-                {% endif %}
-
-            </div>
-
-        </div>
-        """,
-        answer=answer
-    )
-
-
-# =========================
-# IMAGE
-# =========================
-
-@app.route("/image")
-def image():
-
-    user = get_user()
-
-    if not user:
-        return redirect(url_for("login"))
-
-    return render_template_string(
-        CSS + """
-        <div class="container">
-
-            <div class="card">
-
-                <h1>🖼️ AI IMAGE</h1>
-
-                <form>
-
-                    <textarea
-                        rows="6"
-                        placeholder="Rasm uchun prompt..."></textarea>
-
-                    <button>
-                        Rasm yaratish
-                    </button>
-
-                </form>
-
-                <p class="danger">
-                    AI image engine hali ulanmagan.
-                </p>
-
-            </div>
-
-        </div>
-        """
-    )
-
-
-# =========================
-# VIDEO
-# =========================
-
-@app.route("/video")
-def video():
-
-    user = get_user()
-
-    if not user:
-        return redirect(url_for("login"))
-
-    return render_template_string(
-        CSS + """
-        <div class="container">
-
-            <div class="card">
-
-                <h1>🎬 AI VIDEO</h1>
-
-                <form>
-
-                    <textarea
-                        rows="6"
-                        placeholder="Video prompt..."></textarea>
-
-                    <button>
-                        Video yaratish
-                    </button>
-
-                </form>
-
-                <p class="danger">
-                    AI video engine hali ulanmagan.
-                </p>
-
-            </div>
-
-        </div>
-        """
-    )
-
-
-# =========================
-# ADMIN PANEL
-# =========================
-
-@app.route("/admin")
-@admin_required
-def admin():
-
-    con = db()
-
-    users = con.execute(
-        "SELECT * FROM users ORDER BY id DESC"
-    ).fetchall()
-
-    receipts = con.execute("""
-        SELECT receipts.*, users.name, users.email
-        FROM receipts
-        JOIN users ON users.id = receipts.user_id
-        ORDER BY receipts.id DESC
-    """).fetchall()
-
-    plans = con.execute(
-        "SELECT * FROM plans"
-    ).fetchall()
-
-    settings = con.execute(
-        "SELECT * FROM settings"
-    ).fetchall()
-
-    con.close()
-
-    return render_template_string(
-        CSS + """
-        <nav>
-            <div class="logo">AI <span>ADMIN</span></div>
-            <a href="/dashboard">User panel</a>
-        </nav>
-
-        <div class="container">
-
-            <h1>👑 Admin Panel</h1>
-
-            <div class="grid">
-
-                <div class="card">
-                    <h2>👥 Users</h2>
-                    <h1>{{users|length}}</h1>
-                </div>
-
-                <div class="card">
-                    <h2>🧾 Receipts</h2>
-                    <h1>{{receipts|length}}</h1>
-                </div>
-
-                <div class="card">
-                    <h2>💎 Plans</h2>
-                    <h1>{{plans|length}}</h1>
-                </div>
-
-            </div>
-
-            <br>
-
-            <div class="card">
-
-                <h2>👥 Foydalanuvchilar</h2>
-
-                <table>
-
-                    <tr>
-                        <th>ID</th>
-                        <th>Ism</th>
-                        <th>Email</th>
-                        <th>Plan</th>
-                        <th>Video</th>
-                        <th>Status</th>
-                    </tr>
-
-                    {% for u in users %}
-
-                    <tr>
-
-                        <td>{{u["id"]}}</td>
-                        <td>{{u["name"]}}</td>
-                        <td>{{u["email"]}}</td>
-                        <td>{{u["plan"]}}</td>
-                        <td>{{u["videos"]}}</td>
-
-                        <td>
-                            {% if u["blocked"] %}
-                                <span class="danger">BLOCKED</span>
-                            {% else %}
-                                <span class="success">ACTIVE</span>
-                            {% endif %}
-                        </td>
-
-                    </tr>
-
-                    {% endfor %}
-
-                </table>
-
-            </div>
-
-            <br>
-
-            <div class="card">
-
-                <h2>🧾 Cheklar</h2>
-
-                {% for r in receipts %}
-
-                    <p>
-                        <b>{{r["name"]}}</b>
-                        — {{r["email"]}}
-                    </p>
-
-                    <p>{{r["text"]}}</p>
-
-                    <hr>
-
-                {% endfor %}
-
-            </div>
-
-            <br>
-
-            <div class="card">
-
-                <h2>💎 Obunalar</h2>
-
-                {% for p in plans %}
-
-                    <p>
-                        <b>{{p["name"]}}</b>
-                        —
-                        {{p["price"]}}
-                        —
-                        {{p["videos"]}} video
-                        —
-                        {{p["images"]}} rasm
-                    </p>
-
-                {% endfor %}
-
-            </div>
-
-            <br>
-
-            <div class="card">
-
-                <h2>⚙️ Sozlamalar</h2>
-
-                <p>
-                    Karta raqami va boshqa sozlamalar
-                    serverdagi admin konfiguratsiyasi orqali
-                    boshqariladi.
-                </p>
-
-            </div>
-
-        </div>
-        """,
-        users=users,
-        receipts=receipts,
-        plans=plans,
-        settings=settings
-    )
-
-
-# =========================
+# =========================================================
 # HEALTH CHECK
-# =========================
+# =========================================================
 
 @app.route("/health")
 def health():
 
-    return {
+    return jsonify({
         "status": "ok",
-        "app": "AI STUDIO"
-    }
+        "gemini_configured": bool(GEMINI_API_KEY)
+    })
 
 
-# =========================
-# RENDER PORT
-# =========================
+# =========================================================
+# CHAT API
+# =========================================================
+
+@app.route("/api/chat", methods=["POST"])
+def api_chat():
+
+    if not client:
+
+        return jsonify({
+            "error":
+                "GEMINI_API_KEY Render Environment Variables "
+                "ichida sozlanmagan."
+        }), 500
+
+    data = request.get_json(silent=True) or {}
+
+    prompt = str(
+        data.get("prompt", "")
+    ).strip()
+
+    if not prompt:
+
+        return jsonify({
+            "error": "Prompt bo'sh."
+        }), 400
+
+    if len(prompt) > 12000:
+
+        return jsonify({
+            "error":
+                "Prompt juda uzun. 12000 belgidan oshirmang."
+        }), 400
+
+    try:
+
+        response = client.models.generate_content(
+
+            model="gemini-3.8-flash",
+
+            contents=prompt,
+
+            config=types.GenerateContentConfig(
+                temperature=0.7,
+                max_output_tokens=4096
+            )
+        )
+
+        answer = response.text
+
+        if not answer:
+            answer = "AI javob qaytarmadi."
+
+        return jsonify({
+            "answer": answer
+        })
+
+    except Exception as e:
+
+        return jsonify({
+            "error":
+                "Gemini API xatosi: " + str(e)
+        }), 500
+
+
+# =========================================================
+# IMAGE API
+# =========================================================
+
+@app.route("/api/image", methods=["POST"])
+def api_image():
+
+    if not client:
+
+        return jsonify({
+            "error":
+                "GEMINI_API_KEY sozlanmagan."
+        }), 500
+
+    data = request.get_json(silent=True) or {}
+
+    prompt = str(
+        data.get("prompt", "")
+    ).strip()
+
+    if not prompt:
+
+        return jsonify({
+            "error": "Rasm promptini yozing."
+        }), 400
+
+    if len(prompt) > 8000:
+
+        return jsonify({
+            "error":
+                "Prompt juda uzun."
+        }), 400
+
+    try:
+
+        response = client.models.generate_content(
+
+            model="gemini-2.5-flash-image",
+
+            contents=prompt,
+
+            config=types.GenerateContentConfig(
+                response_modalities=["IMAGE", "TEXT"]
+            )
+        )
+
+        if not response.candidates:
+
+            return jsonify({
+                "error":
+                    "Gemini hech qanday natija qaytarmadi."
+            }), 500
+
+        for candidate in response.candidates:
+
+            if not candidate.content:
+                continue
+
+            for part in candidate.content.parts:
+
+                if getattr(part, "inline_data", None):
+
+                    image_data = part.inline_data.data
+
+                    if isinstance(
+                        image_data,
+                        str
+                    ):
+                        image_data = base64.b64decode(
+                            image_data
+                        )
+
+                    return jsonify({
+
+                        "image":
+                            base64.b64encode(
+                                image_data
+                            ).decode("utf-8"),
+
+                        "mime_type":
+                            part.inline_data.mime_type
+                            or "image/png"
+                    })
+
+        return jsonify({
+            "error":
+                "Gemini rasm yaratmadi."
+        }), 500
+
+    except Exception as e:
+
+        return jsonify({
+            "error":
+                "Gemini Image API xatosi: " + str(e)
+        }), 500
+
+
+# =========================================================
+# ERROR HANDLERS
+# =========================================================
+
+@app.errorhandler(404)
+def not_found(error):
+
+    return jsonify({
+        "error": "Sahifa topilmadi."
+    }), 404
+
+
+@app.errorhandler(500)
+def server_error(error):
+
+    return jsonify({
+        "error": "Server xatosi."
+    }), 500
+
+
+# =========================================================
+# LOCAL RUN
+# =========================================================
 
 if __name__ == "__main__":
 
-    port = int(os.environ.get("PORT", 10000))
+    port = int(
+        os.getenv("PORT", "5000")
+    )
 
     app.run(
         host="0.0.0.0",
